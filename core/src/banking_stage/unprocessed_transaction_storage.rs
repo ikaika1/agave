@@ -1250,8 +1250,8 @@ mod tests {
         let vote_keypair = Keypair::new();
         let mut vote = Packet::from_data(
             None,
-            new_tower_sync_transaction(
-                TowerSync::default(),
+            new_vote_state_update_transaction(
+                VoteStateUpdate::default(),
                 Hash::new_unique(),
                 &node_keypair,
                 &vote_keypair,

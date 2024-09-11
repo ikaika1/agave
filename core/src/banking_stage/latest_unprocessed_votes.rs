@@ -9,11 +9,7 @@ use {
     solana_runtime::bank::Bank,
     solana_sdk::{
         clock::{Slot, UnixTimestamp},
-<<<<<<< HEAD
-=======
         feature_set::{self},
-        hash::Hash,
->>>>>>> 1334fb5248 (banking_stage: do not insert legacy vote ixs, refactor & unstaked (#2888))
         program_utils::limited_deserialize,
         pubkey::Pubkey,
     },
@@ -137,32 +133,6 @@ impl LatestValidatorVotePacket {
     }
 }
 
-<<<<<<< HEAD
-// TODO: replace this with rand::seq::index::sample_weighted once we can update rand to 0.8+
-// This requires updating dependencies of ed25519-dalek as rand_core is not compatible cross
-// version https://github.com/dalek-cryptography/ed25519-dalek/pull/214
-pub(crate) fn weighted_random_order_by_stake<'a>(
-    bank: &Bank,
-    pubkeys: impl Iterator<Item = &'a Pubkey>,
-) -> impl Iterator<Item = Pubkey> {
-    // Efraimidis and Spirakis algo for weighted random sample without replacement
-    let staked_nodes = bank.staked_nodes();
-    let mut pubkey_with_weight: Vec<(f64, Pubkey)> = pubkeys
-        .filter_map(|&pubkey| {
-            let stake = staked_nodes.get(&pubkey).copied().unwrap_or(0);
-            if stake == 0 {
-                None // Ignore votes from unstaked validators
-            } else {
-                Some((thread_rng().gen::<f64>().powf(1.0 / (stake as f64)), pubkey))
-            }
-        })
-        .collect::<Vec<_>>();
-    pubkey_with_weight.sort_by(|(w1, _), (w2, _)| w1.partial_cmp(w2).unwrap());
-    pubkey_with_weight.into_iter().map(|(_, pubkey)| pubkey)
-}
-
-=======
->>>>>>> 1334fb5248 (banking_stage: do not insert legacy vote ixs, refactor & unstaked (#2888))
 #[derive(Default, Debug)]
 pub(crate) struct VoteBatchInsertionMetrics {
     pub(crate) num_dropped_gossip: usize,
@@ -380,13 +350,8 @@ impl LatestUnprocessedVotes {
         bank: Arc<Bank>,
         forward_packet_batches_by_accounts: &mut ForwardPacketBatchesByAccounts,
     ) -> usize {
-<<<<<<< HEAD
         let mut continue_forwarding = true;
-        let pubkeys_by_stake = weighted_random_order_by_stake(
-            &bank,
-            self.latest_votes_per_pubkey.read().unwrap().keys(),
-        )
-        .collect_vec();
+        let pubkeys_by_stake = self.weighted_random_order_by_stake();
         pubkeys_by_stake
             .into_iter()
             .filter(|&pubkey| {
@@ -424,75 +389,11 @@ impl LatestUnprocessedVotes {
                 false
             })
             .count()
-=======
-        let pubkeys_by_stake = self.weighted_random_order_by_stake();
-        let mut forwarded_count: usize = 0;
-        for pubkey in pubkeys_by_stake {
-            let Some(vote) = self.get_entry(pubkey) else {
-                continue;
-            };
-
-            let mut vote = vote.write().unwrap();
-            if vote.is_vote_taken() || vote.is_forwarded() {
-                continue;
-            }
-
-            let deserialized_vote_packet = vote.vote.as_ref().unwrap().clone();
-            let Some(sanitized_vote_transaction) = deserialized_vote_packet
-                .build_sanitized_transaction(
-                    bank.vote_only_bank(),
-                    bank.as_ref(),
-                    bank.get_reserved_account_keys(),
-                )
-            else {
-                continue;
-            };
-
-            let forwarding_successful = forward_packet_batches_by_accounts.try_add_packet(
-                &sanitized_vote_transaction,
-                deserialized_vote_packet,
-                &bank.feature_set,
-            );
-
-            if !forwarding_successful {
-                // To match behavior of regular transactions we stop forwarding votes as soon as one
-                // fails. We are assuming that failure (try_add_packet) means no more space
-                // available.
-                break;
-            }
-
-            vote.forwarded = true;
-            forwarded_count += 1;
-        }
-
-        forwarded_count
->>>>>>> 1334fb5248 (banking_stage: do not insert legacy vote ixs, refactor & unstaked (#2888))
     }
 
     /// Drains all votes yet to be processed sorted by a weighted random ordering by stake
-    pub fn drain_unprocessed(&self, bank: Arc<Bank>) -> Vec<Arc<ImmutableDeserializedPacket>> {
-<<<<<<< HEAD
-        let pubkeys_by_stake = weighted_random_order_by_stake(
-            &bank,
-            self.latest_votes_per_pubkey.read().unwrap().keys(),
-        )
-        .collect_vec();
-        pubkeys_by_stake
-            .into_iter()
-=======
-        let slot_hashes = bank
-            .get_account(&sysvar::slot_hashes::id())
-            .and_then(|account| from_account::<SlotHashes, _>(&account));
-        if slot_hashes.is_none() {
-            error!(
-                "Slot hashes sysvar doesn't exist on bank {}. Including all votes without \
-                 filtering",
-                bank.slot()
-            );
-        }
-
+    pub fn drain_unprocessed(&self, _bank: Arc<Bank>) -> Vec<Arc<ImmutableDeserializedPacket>> {
         self.weighted_random_order_by_stake()
->>>>>>> 1334fb5248 (banking_stage: do not insert legacy vote ixs, refactor & unstaked (#2888))
             .filter_map(|pubkey| {
                 self.get_entry(pubkey).and_then(|lock| {
                     let mut latest_vote = lock.write().unwrap();
@@ -1015,24 +916,15 @@ mod tests {
 
     #[test]
     fn test_forwardable_packets() {
-<<<<<<< HEAD
-        let latest_unprocessed_votes = LatestUnprocessedVotes::new();
-        let bank = Arc::new(Bank::default_for_tests());
-=======
         let latest_unprocessed_votes = LatestUnprocessedVotes::default();
         let bank_0 = Bank::new_for_tests(&GenesisConfig::default());
-        let mut bank = Bank::new_from_parent(
+        let bank = Bank::new_from_parent(
             Arc::new(bank_0),
             &Pubkey::new_unique(),
             MINIMUM_SLOTS_PER_EPOCH,
         );
         assert_eq!(bank.epoch(), 1);
-        bank.set_epoch_stakes_for_test(
-            bank.epoch().saturating_add(2),
-            EpochStakes::new_for_tests(HashMap::new(), bank.epoch().saturating_add(2)),
-        );
         let bank = Arc::new(bank);
->>>>>>> 1334fb5248 (banking_stage: do not insert legacy vote ixs, refactor & unstaked (#2888))
         let mut forward_packet_batches_by_accounts =
             ForwardPacketBatchesByAccounts::new_with_default_batch_limits();
 

@@ -854,7 +854,7 @@ pub mod enable_turbine_extended_fanout_experiments {
 }
 
 pub mod deprecate_legacy_vote_ixs {
-    solana_program::declare_id!("depVvnQ2UysGrhwdiwU42tCadZL8GcBb1i2GYhMopQv");
+    solana_program::declare_id!("mustrekeyysGrhwdiwU42tCadZL8GcBb1i2GYhMopQv");
 }
 
 lazy_static! {

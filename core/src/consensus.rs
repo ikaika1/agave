@@ -1,4 +1,4 @@
-use crate::replay_stage::DUPLICATE_THRESHOLD;
+use {crate::replay_stage::DUPLICATE_THRESHOLD, solana_sdk::feature_set};
 
 pub mod fork_choice;
 pub mod heaviest_subtree_fork_choice;
@@ -42,10 +42,13 @@ use {
     std::{
         cmp::Ordering,
         collections::{HashMap, HashSet},
+        fs::read_to_string,
         ops::{
             Bound::{Included, Unbounded},
             Deref,
         },
+        path::Path,
+        time::SystemTime,
     },
     thiserror::Error,
 };
@@ -203,6 +206,11 @@ impl TowerVersions {
                     last_timestamp: tower.last_timestamp,
                     stray_restored_slot: tower.stray_restored_slot,
                     last_switch_threshold_check: tower.last_switch_threshold_check,
+                    mostly_confirmed_threshold: None,
+                    threshold_ahead_count: None,
+                    after_skip_threshold: None,
+                    threshold_escape_count: None,
+                    last_config_check_seconds: 0, 
                 }
             }
             TowerVersions::V1_14_11(tower) => Tower {
@@ -216,6 +224,12 @@ impl TowerVersions {
                 last_timestamp: tower.last_timestamp,
                 stray_restored_slot: tower.stray_restored_slot,
                 last_switch_threshold_check: tower.last_switch_threshold_check,
+            
+                mostly_confirmed_threshold: None,
+                threshold_ahead_count: None,
+                after_skip_threshold: None,
+                threshold_escape_count: None,
+                last_config_check_seconds: 0,
             },
             TowerVersions::Current(tower) => tower,
         }
@@ -239,7 +253,7 @@ pub(crate) enum BlockhashStatus {
 #[cfg_attr(
     feature = "frozen-abi",
     derive(AbiExample),
-    frozen_abi(digest = "9ziHa1vA7WG5RCvXiE3g1f2qjSTNa47FB7e2czo7en7a")
+    frozen_abi(digest = "679XkZ4upGc389SwqAsjs5tr2qB4wisqjbwtei7fGhxC")
 )]
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
 pub struct Tower {
@@ -266,6 +280,16 @@ pub struct Tower {
     stray_restored_slot: Option<Slot>,
     #[serde(skip)]
     pub last_switch_threshold_check: Option<(Slot, SwitchForkDecision)>,
+    #[serde(skip)]
+    mostly_confirmed_threshold: Option<f64>,
+    #[serde(skip)]
+    threshold_ahead_count: Option<u8>,
+    #[serde(skip)]
+    after_skip_threshold: Option<u8>,
+    #[serde(skip)]
+    threshold_escape_count: Option<u8>,
+    #[serde(skip)]
+    last_config_check_seconds: u64,
 }
 
 impl Default for Tower {
@@ -280,6 +304,13 @@ impl Default for Tower {
             last_vote_tx_blockhash: BlockhashStatus::default(),
             stray_restored_slot: Option::default(),
             last_switch_threshold_check: Option::default(),
+            mostly_confirmed_threshold: None,
+            threshold_ahead_count: None,
+            after_skip_threshold: None,
+            threshold_escape_count: None,
+            last_config_check_seconds: 0,
+      
+      
         };
         // VoteState::root_slot is ensured to be Some in Tower
         tower.vote_state.root_slot = Some(Slot::default());
@@ -381,7 +412,20 @@ impl Tower {
                 continue;
             }
             trace!("{} {} with stake {}", vote_account_pubkey, key, voted_stake);
-            let mut vote_state = account.vote_state().clone();
+            let mut vote_state = match account.vote_state().cloned() {
+                Err(_) => {
+                    datapoint_warn!(
+                        "tower_warn",
+                        (
+                            "warn",
+                            format!("Unable to get vote_state from account {key}"),
+                            String
+                        ),
+                    );
+                    continue;
+                }
+                Ok(vote_state) => vote_state,
+            };
             for vote in &vote_state.votes {
                 lockout_intervals
                     .entry(vote.lockout.last_locked_out_slot())
@@ -497,8 +541,7 @@ impl Tower {
         }
     }
 
-    #[cfg(test)]
-    fn is_slot_confirmed(
+    pub(crate) fn is_slot_confirmed(
         &self,
         slot: Slot,
         voted_stakes: &VotedStakes,
@@ -521,7 +564,57 @@ impl Tower {
             .map(|stake| (*stake as f64 / total_stake as f64) > DUPLICATE_THRESHOLD)
             .unwrap_or(false)
     }
+    pub fn is_mostly_confirmed_threshold_enabled(&self) -> bool {
+        if let Some(_) = self.mostly_confirmed_threshold {
+            true
+        } else {
+            false
+        }
+    }
 
+    pub fn is_slot_mostly_confirmed(
+        &self,
+        slot: Slot,
+        voted_stakes: &VotedStakes,
+        total_stake: Stake,
+    ) -> bool {
+        let mostly_confirmed_threshold = if let Some(m) = self.mostly_confirmed_threshold {
+            m
+        } else {
+            SWITCH_FORK_THRESHOLD
+        };
+
+        voted_stakes
+            .get(&slot)
+            .map(|stake| (*stake as f64 / total_stake as f64) > mostly_confirmed_threshold)
+            .unwrap_or(false)
+    }
+
+    pub fn is_mostly_confirmed_threshold_enabled(&self) -> bool {
+        if let Some(_) = self.mostly_confirmed_threshold {
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn is_slot_mostly_confirmed(
+        &self,
+        slot: Slot,
+        voted_stakes: &VotedStakes,
+        total_stake: Stake,
+    ) -> bool {
+        let mostly_confirmed_threshold = if let Some(m) = self.mostly_confirmed_threshold {
+            m
+        } else {
+            SWITCH_FORK_THRESHOLD
+        };
+
+        voted_stakes
+            .get(&slot)
+            .map(|stake| (*stake as f64 / total_stake as f64) > mostly_confirmed_threshold)
+            .unwrap_or(false)
+    }
     pub fn tower_slots(&self) -> Vec<Slot> {
         self.vote_state.tower()
     }
@@ -584,17 +677,18 @@ impl Tower {
     pub fn last_voted_slot_in_bank(bank: &Bank, vote_account_pubkey: &Pubkey) -> Option<Slot> {
         let vote_account = bank.get_vote_account(vote_account_pubkey)?;
         let vote_state = vote_account.vote_state();
-        vote_state.last_voted_slot()
+        vote_state.as_ref().ok()?.last_voted_slot()
     }
 
-    pub fn record_bank_vote(&mut self, bank: &Bank) -> Option<Slot> {
+    pub fn record_bank_vote(&mut self, bank: &Bank, pop_expired: bool) -> Option<Slot> {
         // Returns the new root if one is made after applying a vote for the given bank to
         // `self.vote_state`
         self.record_bank_vote_and_update_lockouts(
             bank.slot(),
             bank.hash(),
             bank.feature_set
-                .is_active(&solana_feature_set::enable_tower_sync_ix::id()),
+                .is_active(&feature_set::enable_tower_sync_ix::id()),
+                pop_expired
         )
     }
 
@@ -631,18 +725,144 @@ impl Tower {
         new_vote.set_timestamp(self.maybe_timestamp(self.last_voted_slot().unwrap_or_default()));
         self.last_vote = new_vote;
     }
+    pub fn update_config(&mut self) {
+        // Use this opportunity to possibly load new value for mostly_confirmed_threshold
+        let config_check_seconds = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .ok()
+            .map_or(0, |x| x.as_secs());
+        if config_check_seconds >= (self.last_config_check_seconds + 60) {
+            // Format of mostly_confirmed_threshold:
+            // a.float b.int c.int d.int
+            // a is threshold - no slot that hasn't already achieved this vote weight will be voted on, except for
+            //   slots in the "vote ahead of threshold" region, unless the escape hatch distance has been reached
+            // b is "vote ahead of threshold" - how many slots ahead of the threshold slot to vote, regardless of
+            //   vote weight.  Reduces vote latency.
+            // c controls what stake weighted vote percentage is required on a slot after there have been skips.  It
+            //   must be one of these values:
+            //   0 -- no restriction
+            //   1 -- a slot after a skip has to have mostly_confirmed_threshold before it will be voted on
+            //   2 -- a slot after a skip has to be confirmed already before it will be voted on
+            // d is "escape hatch distance".  This is the number of slots of non-voting while waiting for threshold
+            //   to just vote anyway.  This is an escape hatch to allow network progress even if threshold is not
+            //   being achieved.  Without this, there could be deadlock if all validators ran this voting strategy
+            //   beacuse if multiple forks happen at once, it's possible for all forks to end up with less than
+            //   the threshold vote and no validator would ever switch forks.
+            warn!("Checking for change to mostly_confirmed_threshold");
+            self.last_config_check_seconds = config_check_seconds;
+            match read_to_string(&Path::new("./mostly_confirmed_threshold")) {
+                Ok(s) => {
+                    let split = s
+                        .strip_suffix("\n")
+                        .unwrap_or("")
+                        .split_whitespace()
+                        .collect::<Vec<&str>>();
+                    match split.get(0).unwrap_or(&"").parse::<f64>() {
+                        Ok(threshold) => {
+                            if let Some(mostly_confirmed_threshold) =
+                                self.mostly_confirmed_threshold
+                            {
+                                if mostly_confirmed_threshold != threshold {
+                                    self.mostly_confirmed_threshold = Some(threshold);
+                                    warn!("Using new mostly_confirmed_threshold: {}", threshold);
+                                }
+                            } else {
+                                self.mostly_confirmed_threshold = Some(threshold);
+                                warn!("Using new mostly_confirmed_threshold: {}", threshold);
+                            }
+                        }
+                        _ => {
+                            warn!("Using NO mostly_confirmed_threshold");
+                            self.mostly_confirmed_threshold = None;
+                        }
+                    }
+                    match split.get(1).unwrap_or(&"").parse::<u8>() {
+                        Ok(count) => {
+                            if let Some(already_count) = self.threshold_ahead_count {
+                                if already_count != count {
+                                    self.threshold_ahead_count = Some(count);
+                                    warn!("Using new threshold_ahead_count: {}", count);
+                                }
+                            } else {
+                                self.threshold_ahead_count = Some(count);
+                                warn!("Using new threshold_ahead_count: {}", count);
+                            }
+                        }
+                        _ => {
+                            warn!("Using NO threshold_ahead_count");
+                            self.threshold_ahead_count = None;
+                        }
+                    }
+                    match split.get(2).unwrap_or(&"").parse::<u8>() {
+                        Ok(threshold) => {
+                            if let Some(already_after_skip_threshold) = self.after_skip_threshold {
+                                if already_after_skip_threshold != threshold {
+                                    self.after_skip_threshold = Some(threshold);
+                                    warn!("Using new after_skip_threshold: {}", threshold);
+                                }
+                            } else {
+                                self.after_skip_threshold = Some(threshold);
+                                warn!("Using new after_skip_threshold: {}", threshold);
+                            }
+                        }
+                        _ => {
+                            warn!("Using NO after_skip_threshold");
+                            self.after_skip_threshold = None;
+                        }
+                    }
+                    match split.get(3).unwrap_or(&"").parse::<u8>() {
+                        Ok(escape) => {
+                            if let Some(already_escape) = self.threshold_escape_count {
+                                if already_escape != escape {
+                                    self.threshold_escape_count = Some(escape);
+                                    warn!("Using new threshold_escape_count: {}", escape);
+                                }
+                            } else {
+                                self.threshold_escape_count = Some(escape);
+                                warn!("Using new threshold_escape_count: {}", escape);
+                            }
+                        }
+                        _ => {
+                            warn!("Using NO threshold_escape_count");
+                            self.threshold_escape_count = None;
+                        }
+                    }
+                }
+                _ => {
+                    warn!("Using NO mostly_confirmed_threshold, threshold_ahead_count, after_skip_threshold, or threshold_escape_count");
+                    self.mostly_confirmed_threshold = None;
+                    self.threshold_ahead_count = None;
+                    self.after_skip_threshold = None;
+                    self.threshold_escape_count = None;
+                }
+            }
+        }
+    }
+
+    pub fn get_threshold_ahead_count(&self) -> Option<u8> {
+        return self.threshold_ahead_count;
+    }
+
+    pub fn get_after_skip_threshold(&self) -> Option<u8> {
+        return self.after_skip_threshold;
+    }
+
+    pub fn get_threshold_escape_count(&self) -> Option<u8> {
+        return self.threshold_escape_count;
+    }
 
     fn record_bank_vote_and_update_lockouts(
         &mut self,
         vote_slot: Slot,
         vote_hash: Hash,
         enable_tower_sync_ix: bool,
+        pop_expired: bool,
     ) -> Option<Slot> {
         trace!("{} record_vote for {}", self.node_pubkey, vote_slot);
         let old_root = self.root();
 
         let vote = Vote::new(vec![vote_slot], vote_hash);
-        let result = process_vote_unchecked(&mut self.vote_state, vote);
+        let result = process_vote_unchecked(&mut self.vote_state, vote, pop_expired);
         if result.is_err() {
             panic!(
                 "Error while recording vote {} {} in local tower {:?}",
@@ -667,7 +887,7 @@ impl Tower {
 
     #[cfg(feature = "dev-context-only-utils")]
     pub fn record_vote(&mut self, slot: Slot, hash: Hash) -> Option<Slot> {
-        self.record_bank_vote_and_update_lockouts(slot, hash, true)
+        self.record_bank_vote_and_update_lockouts(slot, hash, true, true)
     }
 
     /// Used for tests
@@ -787,6 +1007,63 @@ impl Tower {
         false
     }
 
+    pub fn is_locked_out_including(
+        &self,
+        slot: Slot,
+        ancestors: &HashSet<Slot>,
+        including: &Vec<Slot>,
+    ) -> bool {
+        if !self.is_recent(slot) {
+            return true;
+        }
+
+        // Check if a slot is locked out by simulating adding a vote for that
+        // slot to the current lockouts to pop any expired votes. If any of the
+        // remaining voted slots are on a different fork from the checked slot,
+        // it's still locked out.
+        let mut vote_state = self.vote_state.clone();
+
+        for slot in including {
+            process_slot_vote_unchecked(&mut vote_state, *slot);
+        }
+
+        process_slot_vote_unchecked(&mut vote_state, slot);
+        for vote in &vote_state.votes {
+            if slot != vote.slot() && !ancestors.contains(&vote.slot()) {
+                return true;
+            }
+        }
+
+        if let Some(root_slot) = vote_state.root_slot {
+            if slot != root_slot {
+                // This case should never happen because bank forks purges all
+                // non-descendants of the root every time root is set
+                assert!(
+                    ancestors.contains(&root_slot),
+                    "ancestors: {ancestors:?}, slot: {slot} root: {root_slot}"
+                );
+            }
+        }
+
+        false
+    }
+
+    pub fn pop_votes_locked_out_at(&self, new_votes: &mut Vec<Slot>, slot: Slot) {
+        let mut vote_state = self.vote_state.clone();
+
+        for i in 0..new_votes.len() {
+            process_slot_vote_unchecked(&mut vote_state, new_votes[i]);
+            if let Some(last_lockout) = vote_state.last_lockout() {
+                if last_lockout.is_locked_out_at_slot(slot) {
+                    // New votes cannot include this or any subsequent slots
+                    new_votes.truncate(i);
+                    return;
+                }
+            }
+        }
+    }
+
+
     /// Checks if a vote for `candidate_slot` is usable in a switching proof
     /// from `last_voted_slot` to `switch_slot`.
     /// We assume `candidate_slot` is not an ancestor of `last_voted_slot`.
@@ -800,10 +1077,7 @@ impl Tower {
         ancestors: &HashMap<Slot, HashSet<Slot>>,
         last_vote_ancestors: &HashSet<Slot>,
     ) -> Option<bool> {
-        trace!(
-            "Checking if {candidate_slot} is a valid switching proof vote from {last_voted_slot} \
-             to {switch_slot}"
-        );
+        trace!("Checking if {candidate_slot} is a valid switching proof vote from {last_voted_slot} to {switch_slot}");
         // Ignore if the `candidate_slot` is a descendant of the `last_voted_slot`, since we do not
         // want to count votes on the same fork.
         if Self::is_descendant_slot(candidate_slot, last_voted_slot, ancestors)? {
@@ -926,10 +1200,9 @@ impl Tower {
                 // `switch < last` is needed not to warn! this message just because of using
                 // newer snapshots on validator restart
                 let message = format!(
-                    "bank_forks doesn't have corresponding data for the stray restored last \
-                     vote({last_voted_slot}), meaning some inconsistency between saved tower and \
-                     ledger."
-                );
+                            "bank_forks doesn't have corresponding data for the stray restored \
+                           last vote({last_voted_slot}), meaning some inconsistency between saved tower and ledger."
+                        );
                 warn!("{}", message);
                 datapoint_warn!("tower_warn", ("warn", message, String));
             }
@@ -1034,9 +1307,8 @@ impl Tower {
                 return suspended_decision_due_to_major_unsynced_ledger();
             } else {
                 panic!(
-                    "Should never consider switching to ancestor ({switch_slot}) of last vote: \
-                     {last_voted_slot}, ancestors({last_vote_ancestors:?})",
-                );
+                            "Should never consider switching to ancestor ({switch_slot}) of last vote: {last_voted_slot}, ancestors({last_vote_ancestors:?})",
+                        );
             }
         }
 
@@ -1259,8 +1531,7 @@ impl Tower {
 
         let lockout = *fork_stake as f64 / total_stake as f64;
         trace!(
-            "fork_stake slot: {}, threshold_vote slot: {}, lockout: {} fork_stake: {} \
-             total_stake: {}",
+            "fork_stake slot: {}, threshold_vote slot: {}, lockout: {} fork_stake: {} total_stake: {}",
             slot,
             threshold_vote.slot(),
             lockout,
@@ -1425,8 +1696,9 @@ impl Tower {
                 // While this validator's voting is suspended this way,
                 // suspended_decision_due_to_major_unsynced_ledger() will be also touched.
                 let message = format!(
-                    "For some reason, we're REPROCESSING slots which has already been voted and \
-                     ROOTED by us; VOTING will be SUSPENDED UNTIL {last_voted_slot}!",
+                    "For some reason, we're REPROCESSING slots which has already been \
+                     voted and ROOTED by us; \
+                     VOTING will be SUSPENDED UNTIL {last_voted_slot}!",
                 );
                 error!("{}", message);
                 datapoint_error!("tower_error", ("error", message, String));
@@ -1554,8 +1826,7 @@ impl Tower {
             self.last_vote = VoteTransaction::from(Vote::default());
         } else {
             info!(
-                "{} restored votes (out of {}) were on different fork or are upcoming votes on \
-                 unrooted slots: {:?}!",
+                "{} restored votes (out of {}) were on different fork or are upcoming votes on unrooted slots: {:?}!",
                 self.voted_slots().len(),
                 original_votes_len,
                 self.voted_slots()
@@ -1575,7 +1846,10 @@ impl Tower {
         bank: &Bank,
     ) {
         if let Some(vote_account) = bank.get_vote_account(vote_account_pubkey) {
-            self.vote_state = vote_account.vote_state().clone();
+            self.vote_state = vote_account
+                .vote_state()
+                .cloned()
+                .expect("vote_account isn't a VoteState?");
             self.initialize_root(root);
             self.initialize_lockouts(|v| v.slot() > root);
             trace!(
@@ -1629,8 +1903,8 @@ pub enum TowerError {
     WrongTower(String),
 
     #[error(
-        "The tower is too old: newest slot in tower ({0}) << oldest slot in available history \
-         ({1})"
+        "The tower is too old: \
+        newest slot in tower ({0}) << oldest slot in available history ({1})"
     )]
     TooOldTower(Slot, Slot),
 
@@ -1710,15 +1984,13 @@ pub fn reconcile_blockstore_roots_with_external_source(
                 Ordering::Equal => false,
                 Ordering::Less => panic!(
                     "last_blockstore_root({last_blockstore_root}) is skipped while traversing \
-                     blockstore (currently at {current}) from external root \
-                     ({external_source:?})!?",
+                     blockstore (currently at {current}) from external root ({external_source:?})!?",
                 ),
             })
             .collect();
         if !new_roots.is_empty() {
             info!(
-                "Reconciling slots as root based on external root: {:?} (external: {:?}, \
-                 blockstore: {})",
+                "Reconciling slots as root based on external root: {:?} (external: {:?}, blockstore: {})",
                 new_roots, external_source, last_blockstore_root
             );
 
@@ -1741,9 +2013,9 @@ pub fn reconcile_blockstore_roots_with_external_source(
             // That's because we might have a chance of recovering properly with
             // newer snapshot.
             warn!(
-                "Couldn't find any ancestor slots from external source ({:?}) towards blockstore \
-                 root ({}); blockstore pruned or only tower moved into new ledger or just hard \
-                 fork?",
+                "Couldn't find any ancestor slots from external source ({:?}) \
+                 towards blockstore root ({}); blockstore pruned or only \
+                 tower moved into new ledger or just hard fork?",
                 external_source, last_blockstore_root,
             );
         }
@@ -2426,7 +2698,7 @@ pub mod test {
             .get_vote_account(&vote_pubkey)
             .unwrap();
         let state = observed.vote_state();
-        info!("observed tower: {:#?}", state.votes);
+        info!("observed tower: {:#?}", state.as_ref().unwrap().votes);
 
         let num_slots_to_try = 200;
         cluster_votes
@@ -3259,10 +3531,9 @@ pub mod test {
     }
 
     #[test]
-    #[should_panic(
-        expected = "last_blockstore_root(3) is skipped while traversing blockstore (currently at \
-                    1) from external root (Tower(4))!?"
-    )]
+    #[should_panic(expected = "last_blockstore_root(3) is skipped while \
+                               traversing blockstore (currently at 1) from \
+                               external root (Tower(4))!?")]
     fn test_reconcile_blockstore_roots_with_tower_panic_no_common_root() {
         solana_logger::setup();
         let ledger_path = get_tmp_ledger_path_auto_delete!();
@@ -3531,8 +3802,7 @@ pub mod test {
         let result = tower.adjust_lockouts_after_replay(MAX_ENTRIES, &slot_history);
         assert_eq!(
             format!("{}", result.unwrap_err()),
-            "The tower is too old: newest slot in tower (0) << oldest slot in available history \
-             (1)"
+            "The tower is too old: newest slot in tower (0) << oldest slot in available history (1)"
         );
     }
 
@@ -3611,8 +3881,7 @@ pub mod test {
         let result = tower.adjust_lockouts_after_replay(MAX_ENTRIES, &slot_history);
         assert_eq!(
             format!("{}", result.unwrap_err()),
-            "The tower is fatally inconsistent with blockstore: not too old once after got too \
-             old?"
+            "The tower is fatally inconsistent with blockstore: not too old once after got too old?"
         );
     }
 

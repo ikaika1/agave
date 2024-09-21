@@ -4,7 +4,7 @@ use {
         cluster_info_vote_listener::VoteTracker,
         cluster_slots_service::cluster_slots::ClusterSlots,
         consensus::{
-            fork_choice::{select_vote_and_reset_forks, SelectVoteAndResetForkResult},
+            fork_choice::SelectVoteAndResetForkResult,
             heaviest_subtree_fork_choice::HeaviestSubtreeForkChoice,
             latest_validator_votes_for_frozen_banks::LatestValidatorVotesForFrozenBanks,
             progress_map::{ForkProgress, ProgressMap},
@@ -26,12 +26,9 @@ use {
         },
     },
     solana_sdk::{clock::Slot, hash::Hash, pubkey::Pubkey, signature::Signer},
-    solana_vote_program::{
-        vote_state::{process_vote_unchecked, Lockout, TowerSync},
-        vote_transaction,
-    },
+    solana_vote_program::vote_transaction,
     std::{
-        collections::{HashMap, HashSet, VecDeque},
+        collections::{HashMap, HashSet},
         sync::{Arc, RwLock},
     },
     trees::{tr, Tree, TreeWalk},
@@ -101,34 +98,10 @@ impl VoteSimulator {
                 if vote.contains(&parent) {
                     let keypairs = self.validator_keypairs.get(pubkey).unwrap();
                     let latest_blockhash = parent_bank.last_blockhash();
-                    let tower_sync = if let Some(vote_account) =
-                        parent_bank.get_vote_account(&keypairs.vote_keypair.pubkey())
-                    {
-                        let mut vote_state = vote_account.vote_state().clone();
-                        process_vote_unchecked(
-                            &mut vote_state,
-                            solana_vote_program::vote_state::Vote::new(
-                                vec![parent],
-                                parent_bank.hash(),
-                            ),
-                        )
-                        .unwrap();
-                        TowerSync::new(
-                            vote_state.votes.iter().map(|vote| vote.lockout).collect(),
-                            vote_state.root_slot,
-                            parent_bank.hash(),
-                            Hash::default(),
-                        )
-                    } else {
-                        TowerSync::new(
-                            VecDeque::from([Lockout::new(parent)]),
-                            Some(root),
-                            parent_bank.hash(),
-                            Hash::default(),
-                        )
-                    };
-                    let vote_tx = vote_transaction::new_tower_sync_transaction(
-                        tower_sync,
+                    let vote_tx = vote_transaction::new_vote_transaction(
+                        // Must vote > root to be processed
+                        vec![parent],
+                        parent_bank.hash(),
                         latest_blockhash,
                         &keypairs.node_keypair,
                         &keypairs.vote_keypair,
@@ -143,7 +116,12 @@ impl VoteSimulator {
                         .get_vote_account(&keypairs.vote_keypair.pubkey())
                         .unwrap();
                     let state = vote_account.vote_state();
-                    assert!(state.votes.iter().any(|lockout| lockout.slot() == parent));
+                    assert!(state
+                        .as_ref()
+                        .unwrap()
+                        .votes
+                        .iter()
+                        .any(|lockout| lockout.slot() == parent));
                 }
             }
             while new_bank.tick_height() < new_bank.max_tick_height() {
@@ -204,10 +182,11 @@ impl VoteSimulator {
 
         // Try to vote on the given slot
         let descendants = self.bank_forks.read().unwrap().descendants();
+        let mut last_logged_vote_slot = 0;
         let SelectVoteAndResetForkResult {
             heaviest_fork_failures,
             ..
-        } = select_vote_and_reset_forks(
+        } = ReplayStage::select_vote_and_reset_forks(
             &vote_bank,
             None,
             &ancestors,
@@ -216,6 +195,7 @@ impl VoteSimulator {
             tower,
             &self.latest_validator_votes_for_frozen_banks,
             &self.heaviest_subtree_fork_choice,
+            &mut last_logged_vote_slot,
         );
 
         // Make sure this slot isn't locked out or failing threshold
@@ -224,7 +204,7 @@ impl VoteSimulator {
             return heaviest_fork_failures;
         }
 
-        let new_root = tower.record_bank_vote(&vote_bank);
+        let new_root = tower.record_bank_vote(&vote_bank, true);
         if let Some(new_root) = new_root {
             self.set_root(new_root);
         }

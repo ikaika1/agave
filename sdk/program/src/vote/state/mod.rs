@@ -609,7 +609,7 @@ impl VoteState {
             return;
         }
 
-        if pop_expired {
+           if pop_expired {
             self.pop_expired_votes(next_vote_slot);
         }
 
